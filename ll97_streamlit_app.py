@@ -12,15 +12,40 @@ st.set_page_config(
 )
 
 # Path to your CLEANED file
-# If it's inside "data/", change to: "data/LL97_cleaned_no_outliers.csv"
 CSV_PATH = "LL97_cleaned_no_outliers.csv"
 
 type_col = "Primary Property Type - Self Selected"
 gfa_col = "Property GFA - Self-Reported (ft²)"
 year_built_col = "Year Built"
-city_col = "City"
 fine_2024_col = "Fine_2024_$"
 fine_2030_col = "Fine_2030_$"
+borough_col = "Borough"
+
+# -----------------------------
+# ZIP → BOROUGH MAPPING
+# -----------------------------
+zip_to_borough = {
+    # Manhattan
+    **{str(z): "Manhattan" for z in range(10001, 10293)},
+
+    # Bronx
+    **{str(z): "Bronx" for z in list(range(10451, 10476)) + [10499]},
+
+    # Brooklyn
+    **{str(z): "Brooklyn" for z in range(11201, 11257)},
+
+    # Queens
+    **{str(z): "Queens" for z in list(range(11004, 11110)) + list(range(11351, 11698))},
+
+    # Staten Island
+    **{str(z): "Staten Island" for z in range(10301, 10315)},
+}
+
+
+def find_borough(zipcode):
+    zipcode = str(zipcode).strip()
+    zipcode = zipcode[:5]  # first 5 digits
+    return zip_to_borough.get(zipcode, "Unknown")
 
 
 # -----------------------------
@@ -174,10 +199,12 @@ except Exception as e:
     st.error(f"Error loading CSV: {e}")
     st.stop()
 
-# Safety check for City column
-if city_col not in df_raw.columns:
-    st.error(f"City column '{city_col}' not found in CSV. Available columns include: {list(df_raw.columns)[:20]}")
-    st.stop()
+# Create Borough column from Postal Code
+if "Postal Code" in df_raw.columns:
+    df_raw[borough_col] = df_raw["Postal Code"].apply(find_borough)
+else:
+    st.warning("Postal Code column not found; Borough set to 'Unknown' for all rows.")
+    df_raw[borough_col] = "Unknown"
 
 df_viz = prepare_viz_data(df_raw)
 summary = build_summary(df_viz)
@@ -229,10 +256,10 @@ summary_age = (
 summary_age = summary_age.dropna(subset=["Age_10yr_bucket"])
 summary_age = add_pct_and_avg(summary_age, "Age_10yr_bucket")
 
-# Summary by City
-summary_city = (
+# Summary by Borough
+summary_borough = (
     df_viz
-    .groupby(city_col, dropna=False)
+    .groupby(borough_col, dropna=False)
     .agg(
         n_buildings=("Property ID", "count"),
         n_paying_2024=("Fine2024_flag", "sum"),
@@ -242,8 +269,10 @@ summary_city = (
     )
     .reset_index()
 )
-summary_city = summary_city.dropna(subset=[city_col])
-summary_city = add_pct_and_avg(summary_city, city_col)
+
+# Drop Unknown from borough chart (optional)
+summary_borough = summary_borough[summary_borough[borough_col] != "Unknown"]
+summary_borough = add_pct_and_avg(summary_borough, borough_col)
 
 # -----------------------------
 # KPI CARDS (entire dataset)
@@ -449,34 +478,25 @@ fig_age.update_layout(
     yaxis_title="% of buildings paying fines",
     yaxis_range=[0, 100],
     xaxis_tickangle=-45,
-    margin=dict(l=10, r=10, t=40, b=140),
+    margin=dict(l=10, r=10, t=40, b=180),
 )
 
 st.plotly_chart(fig_age, use_container_width=True)
 
 # -----------------------------
-# BAR: % PAYING BY CITY (TOP 10 BY # PAYING 2024)
+# BAR: % PAYING BY BOROUGH
 # -----------------------------
-st.subheader("Share of buildings paying fines by city (top 10 cities by # paying in 2024)")
+st.subheader("Share of buildings paying fines by borough")
 
-# Pick top 10 cities by n_paying_2024
-top_cities = (
-    summary_city.sort_values("n_paying_2024", ascending=False)
-    .head(10)[city_col]
-    .tolist()
-)
-
-summary_city_top = summary_city[summary_city[city_col].isin(top_cities)].copy()
-
-# Preserve order on x-axis
-summary_city_top[city_col] = pd.Categorical(
-    summary_city_top[city_col],
-    categories=top_cities,
+borough_order = ["Manhattan", "Brooklyn", "Queens", "Bronx", "Staten Island"]
+summary_borough[borough_col] = pd.Categorical(
+    summary_borough[borough_col],
+    categories=borough_order,
     ordered=True
 )
 
-long_city = summary_city_top.melt(
-    id_vars=[city_col, "n_buildings", "n_paying_2024", "n_paying_2030",
+long_borough = summary_borough.melt(
+    id_vars=[borough_col, "n_buildings", "n_paying_2024", "n_paying_2030",
              "fines_2024_total", "fines_2030_total",
              "avg_fine_2024", "avg_fine_2030"],
     value_vars=["pct_2024", "pct_2030"],
@@ -484,12 +504,12 @@ long_city = summary_city_top.melt(
     value_name="Percent Paying",
 )
 
-long_city["Fine Year"] = long_city["Fine Year"].map(year_label_map)
-long_city["Avg Fine (per paying bldg)"] = long_city.apply(_choose_avg, axis=1)
+long_borough["Fine Year"] = long_borough["Fine Year"].map(year_label_map)
+long_borough["Avg Fine (per paying bldg)"] = long_borough.apply(_choose_avg, axis=1)
 
-fig_city = px.bar(
-    long_city,
-    x=city_col,
+fig_borough = px.bar(
+    long_borough,
+    x=borough_col,
     y="Percent Paying",
     color="Fine Year",
     barmode="group",
@@ -500,14 +520,14 @@ fig_city = px.bar(
     ],
 )
 
-fig_city.update_traces(
+fig_borough.update_traces(
     texttemplate="%{y:.0f}%",
     textposition="outside",
 )
 
-fig_city.update_traces(
+fig_borough.update_traces(
     hovertemplate=(
-        "City: %{x}<br>"
+        "Borough: %{x}<br>"
         "Year: %{marker.color}<br>"
         "Percent paying: %{y:.0f}%<br>"
         "Buildings: %{customdata[0]:,}<br>"
@@ -520,15 +540,15 @@ fig_city.update_traces(
     )
 )
 
-fig_city.update_layout(
-    xaxis_title="City",
+fig_borough.update_layout(
+    xaxis_title="Borough",
     yaxis_title="% of buildings paying fines",
     yaxis_range=[0, 100],
-    xaxis_tickangle=45,
-    margin=dict(l=10, r=10, t=40, b=160),
+    xaxis_tickangle=0,
+    margin=dict(l=10, r=10, t=40, b=80),
 )
 
-st.plotly_chart(fig_city, use_container_width=True)
+st.plotly_chart(fig_borough, use_container_width=True)
 
 st.markdown("---")
 
@@ -537,17 +557,15 @@ st.markdown("---")
 # =========================================================
 st.subheader("Fine severity distribution by building type (% of paying buildings)")
 
-# Define severity bands and bright, happy colors
 sev_bins = [0, 10_000, 50_000, 200_000, 1_000_000, np.inf]
 sev_labels = ["0–10k", "10k–50k", "50k–200k", "200k–1M", "1M+"]
 
-# bright / playful palette
 severity_color_map = {
-    "0–10k":   "#FFD166",  # warm yellow
-    "10k–50k": "#06D6A0",  # bright teal/green
-    "50k–200k": "#118AB2", # vivid blue
-    "200k–1M": "#EF476F",  # hot pink/red
-    "1M+":    "#9B5DE5",   # bright purple
+    "0–10k":   "#FFD166",
+    "10k–50k": "#06D6A0",
+    "50k–200k": "#118AB2",
+    "200k–1M": "#EF476F",
+    "1M+":    "#9B5DE5",
 }
 
 # ---------- 2024 ----------
@@ -679,12 +697,225 @@ if not df_sev_2030.empty:
         yaxis_title="% of paying buildings (within type)",
         yaxis_range=[0, 100],
         xaxis_tickangle=-45,
-        margin=dict(l=10, r=10, t=40, b=180),
+        margin=dict(l=10, r=10, t=40, b=200),
     )
 
     st.plotly_chart(fig_sev_2030, use_container_width=True)
 else:
     st.info("No 2030 fines found to compute severity bands.")
+
+st.markdown("---")
+
+# =========================================================
+# NEW: QUINTILE DISTRIBUTION BY BUILDING TYPE
+# =========================================================
+st.subheader("Fine distribution by building type – quintiles of fines (per paying building)")
+
+# 🔍 Explanation block for quintiles
+st.markdown(
+    """
+**How to read these quintile charts**
+
+- We only look at buildings that **actually pay a fine**.
+- For each building type, we:
+  - sort all paying buildings from **smallest fine → largest fine**, then  
+  - split them into **5 equal-sized groups (quintiles)**:
+    - **Q1** = lowest 20% of fines  
+    - **Q2** = next 20%  
+    - **Q3** = middle 20%  
+    - **Q4** = higher 20%  
+    - **Q5** = **highest 20% of fines**
+- Each stacked bar adds up to **100% of paying buildings** for that building type.
+- Colors show **how many of that type** fall into low vs high fine ranges:
+  - more Q1/Q2 → most buildings get **smaller fines**
+  - more Q4/Q5 → many buildings get **very large fines**.
+- On hover, you also see the **fine levels for that type & quintile**:
+  - how many buildings are in that quintile  
+  - min, max, and median fine in that group.
+"""
+)
+
+quintile_labels = [
+    "Q1 (lowest fines)",
+    "Q2",
+    "Q3",
+    "Q4",
+    "Q5 (highest fines)"
+]
+
+quintile_color_map = {
+    "Q1 (lowest fines)": "#BEE3F8",
+    "Q2": "#90CDF4",
+    "Q3": "#63B3ED",
+    "Q4": "#4299E1",
+    "Q5 (highest fines)": "#3182CE",
+}
+
+# ---------- 2024 QUINTILES ----------
+st.markdown("**2024 – fine quintiles within each building type (only paying buildings)**")
+
+df_q_2024 = df_viz[df_viz[fine_2024_col] > 0].copy()
+
+if not df_q_2024.empty and df_q_2024[fine_2024_col].nunique() > 1:
+    df_q_2024["Fine_2024_quintile"] = pd.qcut(
+        df_q_2024[fine_2024_col],
+        5,
+        labels=quintile_labels,
+        duplicates="drop"
+    )
+
+    q_summary_2024 = (
+        df_q_2024
+        .groupby([type_col, "Fine_2024_quintile"], dropna=False)
+        .agg(
+            n_buildings=("Property ID", "count"),
+            min_fine_2024=(fine_2024_col, "min"),
+            max_fine_2024=(fine_2024_col, "max"),
+            median_fine_2024=(fine_2024_col, "median"),
+        )
+        .reset_index()
+    )
+
+    q_summary_2024[type_col] = q_summary_2024[type_col].astype(str)
+    q_summary_2024["n_buildings"] = q_summary_2024["n_buildings"].fillna(0).round(0).astype(int)
+
+    for col in ["min_fine_2024", "max_fine_2024", "median_fine_2024"]:
+        q_summary_2024[col] = q_summary_2024[col].fillna(0).round(0).astype(int)
+
+    total_per_type_2024_q = q_summary_2024.groupby(type_col)["n_buildings"].transform("sum")
+    q_summary_2024["pct_buildings"] = np.where(
+        total_per_type_2024_q > 0,
+        q_summary_2024["n_buildings"] / total_per_type_2024_q * 100,
+        0
+    )
+    q_summary_2024["pct_buildings"] = q_summary_2024["pct_buildings"].round(0).astype(int)
+
+    fig_q_2024 = px.bar(
+        q_summary_2024,
+        x=type_col,
+        y="pct_buildings",
+        color="Fine_2024_quintile",
+        barmode="stack",
+        category_orders={"Fine_2024_quintile": quintile_labels},
+        color_discrete_map=quintile_color_map,
+        custom_data=[
+            "n_buildings",
+            "min_fine_2024",
+            "max_fine_2024",
+            "median_fine_2024",
+        ],
+    )
+
+    fig_q_2024.update_traces(
+        texttemplate="%{y:.0f}%",
+        textposition="inside",
+        hovertemplate=(
+            "%{x}<br>"
+            "Quintile: %{marker.color}<br>"
+            "Share of paying buildings: %{y:.0f}%<br>"
+            "Count in this quintile: %{customdata[0]:,}<br>"
+            "Fine range in this quintile: $%{customdata[1]:,.0f} – $%{customdata[2]:,.0f}<br>"
+            "Median fine: $%{customdata[3]:,.0f}"
+            "<extra></extra>"
+        ),
+    )
+
+    fig_q_2024.update_layout(
+        title="2024 LL97 fine quintile distribution by building type (within-type % of paying buildings)",
+        xaxis_title="Building type",
+        yaxis_title="% of paying buildings (within type)",
+        yaxis_range=[0, 100],
+        xaxis_tickangle=-45,
+        margin=dict(l=10, r=10, t=40, b=200),
+    )
+
+    st.plotly_chart(fig_q_2024, use_container_width=True)
+else:
+    st.info("Not enough variation in 2024 fines to compute quintiles.")
+
+st.markdown("---")
+
+# ---------- 2030 QUINTILES ----------
+st.markdown("**2030 – fine quintiles within each building type (only paying buildings)**")
+
+df_q_2030 = df_viz[df_viz[fine_2030_col] > 0].copy()
+
+if not df_q_2030.empty and df_q_2030[fine_2030_col].nunique() > 1:
+    df_q_2030["Fine_2030_quintile"] = pd.qcut(
+        df_q_2030[fine_2030_col],
+        5,
+        labels=quintile_labels,
+        duplicates="drop"
+    )
+
+    q_summary_2030 = (
+        df_q_2030
+        .groupby([type_col, "Fine_2030_quintile"], dropna=False)
+        .agg(
+            n_buildings=("Property ID", "count"),
+            min_fine_2030=(fine_2030_col, "min"),
+            max_fine_2030=(fine_2030_col, "max"),
+            median_fine_2030=(fine_2030_col, "median"),
+        )
+        .reset_index()
+    )
+
+    q_summary_2030[type_col] = q_summary_2030[type_col].astype(str)
+    q_summary_2030["n_buildings"] = q_summary_2030["n_buildings"].fillna(0).round(0).astype(int)
+
+    for col in ["min_fine_2030", "max_fine_2030", "median_fine_2030"]:
+        q_summary_2030[col] = q_summary_2030[col].fillna(0).round(0).astype(int)
+
+    total_per_type_2030_q = q_summary_2030.groupby(type_col)["n_buildings"].transform("sum")
+    q_summary_2030["pct_buildings"] = np.where(
+        total_per_type_2030_q > 0,
+        q_summary_2030["n_buildings"] / total_per_type_2030_q * 100,
+        0
+    )
+    q_summary_2030["pct_buildings"] = q_summary_2030["pct_buildings"].round(0).astype(int)
+
+    fig_q_2030 = px.bar(
+        q_summary_2030,
+        x=type_col,
+        y="pct_buildings",
+        color="Fine_2030_quintile",
+        barmode="stack",
+        category_orders={"Fine_2030_quintile": quintile_labels},
+        color_discrete_map=quintile_color_map,
+        custom_data=[
+            "n_buildings",
+            "min_fine_2030",
+            "max_fine_2030",
+            "median_fine_2030",
+        ],
+    )
+
+    fig_q_2030.update_traces(
+        texttemplate="%{y:.0f}%",
+        textposition="inside",
+        hovertemplate=(
+            "%{x}<br>"
+            "Quintile: %{marker.color}<br>"
+            "Share of paying buildings: %{y:.0f}%<br>"
+            "Count in this quintile: %{customdata[0]:,}<br>"
+            "Fine range in this quintile: $%{customdata[1]:,.0f} – $%{customdata[2]:,.0f}<br>"
+            "Median fine: $%{customdata[3]:,.0f}"
+            "<extra></extra>"
+        ),
+    )
+
+    fig_q_2030.update_layout(
+        title="2030 LL97 fine quintile distribution by building type (within-type % of paying buildings)",
+        xaxis_title="Building type",
+        yaxis_title="% of paying buildings (within type)",
+        yaxis_range=[0, 100],
+        xaxis_tickangle=-45,
+        margin=dict(l=10, r=10, t=40, b=200),
+    )
+
+    st.plotly_chart(fig_q_2030, use_container_width=True)
+else:
+    st.info("Not enough variation in 2030 fines to compute quintiles.")
 
 st.markdown("---")
 
