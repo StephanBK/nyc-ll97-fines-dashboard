@@ -478,7 +478,7 @@ fig_age.update_layout(
     yaxis_title="% of buildings paying fines",
     yaxis_range=[0, 100],
     xaxis_tickangle=-45,
-    margin=dict(l=10, r=10, t=40, b=180),
+    margin=dict(l=10, r=10, t=180, b=180),
 )
 
 st.plotly_chart(fig_age, use_container_width=True)
@@ -924,3 +924,560 @@ st.markdown("---")
 # -----------------------------
 with st.expander("Show raw data (first 500 rows)"):
     st.write(df_viz.head(500))
+
+# =====================================================================
+# TOP-20 INVESTOR DRILLDOWN (MASTER VIEW + TIMELINES + DOWNLOAD)
+# =====================================================================
+st.markdown("---")
+st.header("Top 20 LL97 Buildings – Investor Drilldown")
+
+st.markdown(
+    """
+This section focuses on the **top 20 LL97-exposed buildings by typology and overall**  
+and brings together **fines, retrofit permit history, and ownership** into a single investor view.
+"""
+)
+
+# Paths for the top-20 artifacts (already created in your notebook work)
+TOP20_MASTER_PATH = "LL97_top20_master_investor_view.csv"
+TOP20_TIMELINE_PATH = "LL97_top20_permit_timeline_20yr.csv"
+
+@st.cache_data
+def load_top20_master(path: str) -> pd.DataFrame:
+    df = pd.read_csv(path, low_memory=False)
+    # Ensure a unified ID column
+    if "PropertyID" in df.columns and "Property ID" not in df.columns:
+        df["Property ID"] = df["PropertyID"]
+    return df
+
+
+@st.cache_data
+def load_top20_timeline(path: str) -> pd.DataFrame:
+    df = pd.read_csv(path, low_memory=False, parse_dates=["permit_date"])
+    # Mirror ID naming for joins/filtering
+    if "PropertyID" not in df.columns and "Property ID" in df.columns:
+        df["PropertyID"] = df["Property ID"]
+    return df
+
+
+def ensure_permit_category(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Make sure df has a 'permit_category' column.
+    If it already exists, just clean NaNs.
+    Otherwise, derive a simple Mechanical vs Other vs Unknown classification
+    from text-like columns.
+    """
+    df = df.copy()
+
+    if "permit_category" in df.columns:
+        df["permit_category"] = df["permit_category"].fillna("Unknown").astype(str)
+        return df
+
+    # Fallback: derive from text columns
+    mech_keywords = [
+        "mech", "hvac", "boiler", "chiller", "cooling", "heating",
+        "steam", "furnace", "ventilation", "air handler", "ac unit",
+        "mechanical equipment", "condenser", "compressor"
+    ]
+
+    # Candidate text columns: anything with desc/scope/work/type/category in name
+    text_cols = [
+        c for c in df.columns
+        if any(k in c.lower() for k in ["desc", "scope", "work", "type", "category"])
+    ]
+
+    if not text_cols:
+        # Nothing to inspect – everything becomes Unknown
+        df["permit_category"] = "Unknown"
+        return df
+
+    def classify_row(row):
+        combined = " ".join(str(row[c]) for c in text_cols if c in row.index).lower()
+        if any(k in combined for k in mech_keywords):
+            return "Mechanical / HVAC"
+        elif combined.strip():
+            return "Other permit"
+        else:
+            return "Unknown"
+
+    df["permit_category"] = df.apply(classify_row, axis=1)
+    return df
+
+
+# Try to load the master view
+try:
+    top20_master = load_top20_master(TOP20_MASTER_PATH)
+except Exception as e:
+    st.info(
+        f"Top-20 master dataset not found or not readable at `{TOP20_MASTER_PATH}`.\n\n"
+        f"Error: {e}"
+    )
+    top20_master = None
+
+if top20_master is not None:
+    # -----------------------------
+    # DOWNLOAD BUTTON (WITH $ FORMATTING)
+    # -----------------------------
+    st.subheader("Download full top-20 master dataset")
+
+    st.markdown(
+        """
+This CSV combines, for each of the top-20 buildings:
+
+- **LL97 fines** (2024 & 2030)  
+- **Basic building attributes** (typology, address, postal code)  
+- **Energy-related permit history** (count, first/last permit year, type mix)  
+- **Ownership snapshot** (primary owner name + high-level category)
+"""
+    )
+
+    # Create a copy only for download, with fine columns formatted as $ and rounded
+    top20_master_dl = top20_master.copy()
+    for fine_col in ["Fine_2024_$", "Fine_2030_$"]:
+        if fine_col in top20_master_dl.columns:
+            top20_master_dl[fine_col] = (
+                top20_master_dl[fine_col]
+                .round(0)
+                .fillna(0)
+                .astype(int)
+                .map(lambda x: f"${x:,.0f}")
+            )
+
+    st.download_button(
+        label="⬇️ Download Top-20 LL97 Master Investor View (CSV)",
+        data=top20_master_dl.to_csv(index=False),
+        file_name="LL97_top20_master_investor_view.csv",
+        mime="text/csv",
+    )
+
+    st.markdown("---")
+
+    # -----------------------------
+    # FILTERS (ONLY BY TYPOLOGY)
+    # -----------------------------
+    st.subheader("Filter the universe (by typology)")
+
+    if "Primary Property Type - Self Selected" in top20_master.columns:
+        type_options = sorted(top20_master["Primary Property Type - Self Selected"].dropna().unique())
+    else:
+        type_options = []
+
+    selected_types = st.multiselect(
+        "Building typologies (from top-20 set)",
+        options=type_options,
+        default=type_options,
+    ) if type_options else []
+
+    filtered = top20_master.copy()
+
+    if selected_types and "Primary Property Type - Self Selected" in filtered.columns:
+        filtered = filtered[filtered["Primary Property Type - Self Selected"].isin(selected_types)]
+
+    st.caption(f"Filtered top-20 rows: **{len(filtered)}** (out of 140)")
+
+    # -----------------------------
+    # TABS FOR INVESTOR VIEWS
+    # -----------------------------
+    tab_summary, tab_timeline, tab_owners = st.tabs(
+        ["🏢 Fines & building tables", "📈 Retrofit permits (time & type)", "🏦 Ownership mix"]
+    )
+
+    # -----------------------------------------------------------------
+    # TAB 1 – FINES & BUILDING TABLES (TOP 20 BY 2024/2030 FINES)
+    # -----------------------------------------------------------------
+    with tab_summary:
+        st.markdown(
+            """
+We rank the **top 20 buildings by LL97 fines** to show where  
+**absolute $ exposure** is concentrated, within the already-filtered universe.
+"""
+        )
+
+        base_cols_pref = [
+            "PropertyID", "Property ID",
+            "Primary Property Type - Self Selected",
+            "Address 1", "Postal Code",
+            "Fine_2024_$", "Fine_2030_$",
+            "n_energy_permits",
+            "first_permit_year", "last_permit_year",
+            "primary_owner", "owner_category",
+        ]
+
+        existing_base_cols = [c for c in base_cols_pref if c in filtered.columns]
+
+        # ---- Top 20 by 2024 fines ----
+        if "Fine_2024_$" in filtered.columns:
+            top_2024 = (
+                filtered.sort_values("Fine_2024_$", ascending=False)
+                .head(20)[existing_base_cols]
+            )
+
+            # Format fine columns with $ and whole dollars for display
+            top_2024_disp = top_2024.copy()
+            for fine_col in ["Fine_2024_$", "Fine_2030_$"]:
+                if fine_col in top_2024_disp.columns:
+                    top_2024_disp[fine_col] = (
+                        top_2024_disp[fine_col]
+                        .round(0)
+                        .fillna(0)
+                        .astype(int)
+                        .map(lambda x: f"${x:,.0f}")
+                    )
+
+            st.subheader("Top 20 by 2024 LL97 fines (within filtered set)")
+            st.dataframe(top_2024_disp, use_container_width=True)
+        else:
+            st.info("Column `Fine_2024_$` not found in top-20 master dataset.")
+
+        st.markdown("---")
+
+        # ---- Top 20 by 2030 fines ----
+        if "Fine_2030_$" in filtered.columns:
+            top_2030 = (
+                filtered.sort_values("Fine_2030_$", ascending=False)
+                .head(20)[existing_base_cols]
+            )
+
+            # Format fine columns with $ and whole dollars for display
+            top_2030_disp = top_2030.copy()
+            for fine_col in ["Fine_2024_$", "Fine_2030_$"]:
+                if fine_col in top_2030_disp.columns:
+                    top_2030_disp[fine_col] = (
+                        top_2030_disp[fine_col]
+                        .round(0)
+                        .fillna(0)
+                        .astype(int)
+                        .map(lambda x: f"${x:,.0f}")
+                    )
+
+            st.subheader("Top 20 by 2030 LL97 fines (within filtered set)")
+            st.dataframe(top_2030_disp, use_container_width=True)
+        else:
+            st.info("Column `Fine_2030_$` not found in top-20 master dataset.")
+
+    # -----------------------------------------------------------------
+    # TAB 2 – PERMIT TIMELINES & PERMIT-TYPE MIX
+    # -----------------------------------------------------------------
+    with tab_timeline:
+        st.markdown(
+            """
+We look at **DOB energy-related permits over the last ~20 years**  
+for these top-20 LL97 buildings:
+
+- Each dot/segment represents **actual capital/maintenance work** on mechanicals, boilers, DHW, etc.  
+- Higher counts in recent years can indicate **active retrofit programs** or **ongoing churn** in systems.
+- Below the time series, we also show **how many permits each building type pulls**,  
+  and how those permits break down by **permit category**.
+"""
+        )
+
+        try:
+            timeline = load_top20_timeline(TOP20_TIMELINE_PATH)
+        except Exception as e:
+            st.info(
+                f"Permit timeline dataset not found or not readable at `{TOP20_TIMELINE_PATH}`.\n\n"
+                f"Error: {e}"
+            )
+            timeline = None
+
+        if timeline is not None and not filtered.empty:
+            # Align IDs
+            if "Property ID" not in filtered.columns and "PropertyID" in filtered.columns:
+                filtered["Property ID"] = filtered["PropertyID"]
+
+            if "Property ID" in filtered.columns and "Property ID" in timeline.columns:
+                id_list = filtered["Property ID"].unique().tolist()
+                tl_filtered = timeline[timeline["Property ID"].isin(id_list)].copy()
+            else:
+                tl_filtered = timeline.copy()
+
+            if tl_filtered.empty:
+                st.info("No matched permits for the current filtered top-20 selection.")
+            else:
+                # Ensure we have permit_category (Mechanical vs Other vs Unknown)
+                tl_filtered = ensure_permit_category(tl_filtered)
+
+                # -----------------------------
+                # CONTROL: VIEW MODE
+                # -----------------------------
+                view_mode = st.radio(
+                    "Permit time-series view",
+                    [
+                        "All permits (by building type)",
+                        "Mechanical vs other (all building types)"
+                    ],
+                    index=0
+                )
+
+                # -----------------------------
+                # TIME-SERIES CHART – MAIN
+                # -----------------------------
+                st.subheader("Energy-related permits per year (top-20 LL97 buildings)")
+
+                if view_mode == "All permits (by building type)":
+                    group_cols = ["permit_year"]
+                    if "Primary Property Type - Self Selected" in tl_filtered.columns:
+                        group_cols.append("Primary Property Type - Self Selected")
+
+                    tl_agg = (
+                        tl_filtered
+                        .groupby(group_cols, dropna=False)
+                        .agg(n_permits=("Job #", "count"))
+                        .reset_index()
+                    )
+
+                    if "Primary Property Type - Self Selected" in tl_agg.columns:
+                        fig_tl = px.line(
+                            tl_agg,
+                            x="permit_year",
+                            y="n_permits",
+                            color="Primary Property Type - Self Selected",
+                            markers=True,
+                        )
+                        fig_tl.update_layout(
+                            xaxis_title="Permit year",
+                            yaxis_title="# of energy-related permits",
+                            hovermode="x unified",
+                            margin=dict(l=10, r=10, t=40, b=40),
+                        )
+                    else:
+                        fig_tl = px.line(
+                            tl_agg,
+                            x="permit_year",
+                            y="n_permits",
+                            markers=True,
+                        )
+                        fig_tl.update_layout(
+                            xaxis_title="Permit year",
+                            yaxis_title="# of energy-related permits (all filtered buildings)",
+                            hovermode="x unified",
+                            margin=dict(l=10, r=10, t=40, b=40),
+                        )
+
+                else:  # Mechanical vs other (all building types)
+                    tl_agg = (
+                        tl_filtered
+                        .groupby(["permit_year", "permit_category"], dropna=False)
+                        .agg(n_permits=("Job #", "count"))
+                        .reset_index()
+                    )
+
+                    tl_agg["permit_category"] = tl_agg["permit_category"].astype(str)
+
+                    fig_tl = px.line(
+                        tl_agg,
+                        x="permit_year",
+                        y="n_permits",
+                        color="permit_category",
+                        markers=True,
+                    )
+                    fig_tl.update_layout(
+                        xaxis_title="Permit year",
+                        yaxis_title="# of permits (all building types)",
+                        hovermode="x unified",
+                        margin=dict(l=10, r=10, t=40, b=40),
+                    )
+
+                st.plotly_chart(fig_tl, use_container_width=True)
+
+                # -----------------------------
+                # NEW: MECHANICAL PERMITS BY TYPE OVER TIME
+                # -----------------------------
+                st.subheader("Mechanical permits per year by building type")
+
+                if "Primary Property Type - Self Selected" in tl_filtered.columns:
+                    mech_only = tl_filtered[tl_filtered["permit_category"] == "Mechanical / HVAC"].copy()
+
+                    if mech_only.empty:
+                        st.info("No Mechanical / HVAC permits found in the filtered top-20 set.")
+                    else:
+                        mech_agg = (
+                            mech_only
+                            .groupby(["permit_year", "Primary Property Type - Self Selected"], dropna=False)
+                            .agg(n_permits=("Job #", "count"))
+                            .reset_index()
+                        )
+
+                        mech_agg["Primary Property Type - Self Selected"] = (
+                            mech_agg["Primary Property Type - Self Selected"].astype(str)
+                        )
+
+                        fig_mech = px.line(
+                            mech_agg,
+                            x="permit_year",
+                            y="n_permits",
+                            color="Primary Property Type - Self Selected",
+                            markers=True,
+                        )
+                        fig_mech.update_layout(
+                            xaxis_title="Permit year",
+                            yaxis_title="# of Mechanical / HVAC permits",
+                            hovermode="x unified",
+                            margin=dict(l=10, r=10, t=40, b=40),
+                        )
+                        st.plotly_chart(fig_mech, use_container_width=True)
+                else:
+                    st.info("Column `Primary Property Type - Self Selected` not found in timeline data; cannot split mechanical permits by type.")
+
+                # ------------------------------------------------------
+                # TOTAL PERMITS PER BUILDING TYPE (OVERVIEW BAR)
+                # ------------------------------------------------------
+                st.subheader("Total energy-related permits by building type (top-20 set)")
+
+                if "Primary Property Type - Self Selected" in tl_filtered.columns:
+                    permits_by_type = (
+                        tl_filtered
+                        .groupby("Primary Property Type - Self Selected", dropna=False)
+                        .agg(n_permits=("Job #", "count"))
+                        .reset_index()
+                    )
+
+                    permits_by_type["Primary Property Type - Self Selected"] = (
+                        permits_by_type["Primary Property Type - Self Selected"].astype(str)
+                    )
+
+                    fig_perm_type = px.bar(
+                        permits_by_type,
+                        x="Primary Property Type - Self Selected",
+                        y="n_permits",
+                        text="n_permits",
+                    )
+                    fig_perm_type.update_traces(
+                        textposition="outside",
+                        hovertemplate=(
+                            "Building type: %{x}<br>"
+                            "# of permits (20yr window): %{y:,}"
+                            "<extra></extra>"
+                        ),
+                    )
+                    fig_perm_type.update_layout(
+                        xaxis_title="Building type",
+                        yaxis_title="# of energy-related permits (all years)",
+                        xaxis_tickangle=-45,
+                        margin=dict(l=10, r=10, t=40, b=140),
+                    )
+                    st.plotly_chart(fig_perm_type, use_container_width=True)
+                else:
+                    st.info("Column `Primary Property Type - Self Selected` not found in timeline data; cannot show permits by building type.")
+
+                # ------------------------------------------------------
+                # PERMITS BY PERMIT CATEGORY (SIMPLE BAR)
+                # ------------------------------------------------------
+                st.subheader("Permit mix by permit category")
+
+                permits_by_cat = (
+                    tl_filtered
+                    .groupby("permit_category", dropna=False)
+                    .agg(n_permits=("Job #", "count"))
+                    .reset_index()
+                )
+
+                permits_by_cat["permit_category"] = permits_by_cat["permit_category"].fillna("Unknown").astype(str)
+
+                fig_cat = px.bar(
+                    permits_by_cat,
+                    x="permit_category",
+                    y="n_permits",
+                    text="n_permits",
+                )
+                fig_cat.update_traces(
+                    textposition="outside",
+                    hovertemplate=(
+                        "Permit category: %{x}<br>"
+                        "# of permits: %{y:,}"
+                        "<extra></extra>"
+                    ),
+                )
+                fig_cat.update_layout(
+                    xaxis_title="Permit category (e.g., Mechanical / HVAC vs Other)",
+                    yaxis_title="# of permits (all filtered buildings)",
+                    xaxis_tickangle=-45,
+                    margin=dict(l=10, r=10, t=40, b=140),
+                )
+                st.plotly_chart(fig_cat, use_container_width=True)
+
+                # NOTE: Stacked permit mix by category & building type removed per request
+
+                # ----------------------------------------------
+                # RAW TIMELINE SLICE
+                # ----------------------------------------------
+                with st.expander("Show raw permit timeline rows (filtered selection)"):
+                    st.dataframe(tl_filtered.sort_values(["Property ID", "permit_date"]).head(1000))
+
+        elif timeline is None:
+            st.stop()
+        else:
+            st.info("No buildings available after filters; adjust filters above to see timeline.")
+
+    # -----------------------------------------------------------------
+    # TAB 3 – OWNERSHIP MIX (WHO OWNS THE TOP-20 FINE EXPOSURE)
+    # -----------------------------------------------------------------
+    with tab_owners:
+        st.markdown(
+            """
+We classify **who actually owns the top-20 LL97 liability**:
+
+- Public housing & government agencies  
+- Universities & educational institutions  
+- Corporate / fund / REIT-style vehicles  
+- Smaller private owners / individuals  
+- Unknown / ambiguous LLCs
+"""
+        )
+
+        if "owner_category" in filtered.columns:
+            own_group = (
+                filtered
+                .assign(owner_category=lambda d: d["owner_category"].fillna("Unknown"))
+                .groupby("owner_category", dropna=False)
+                .agg(
+                    n_buildings=("Property ID", "nunique") if "Property ID" in filtered.columns else ("PropertyID", "nunique"),
+                    total_fines_2024=("Fine_2024_$", "sum") if "Fine_2024_$" in filtered.columns else ("PropertyID", "count"),
+                    total_fines_2030=("Fine_2030_$", "sum") if "Fine_2030_$" in filtered.columns else ("PropertyID", "count"),
+                )
+                .reset_index()
+            )
+
+            total_blds = own_group["n_buildings"].sum()
+            own_group["pct_buildings"] = np.where(
+                total_blds > 0,
+                own_group["n_buildings"] / total_blds * 100,
+                0,
+            ).round(1)
+
+            st.subheader("Ownership mix within the (filtered) top-20 LL97 buildings")
+
+            fig_own = px.bar(
+                own_group,
+                x="owner_category",
+                y="n_buildings",
+                text="n_buildings",
+                hover_data={
+                    "pct_buildings": True,
+                    "total_fines_2024": ":,.0f",
+                    "total_fines_2030": ":,.0f",
+                },
+            )
+            fig_own.update_traces(
+                textposition="outside",
+                hovertemplate=(
+                    "Owner category: %{x}<br>"
+                    "Buildings in top-20 set: %{y:,}<br>"
+                    "Share of filtered top-20: %{customdata[0]:.1f}%<br>"
+                    "Total 2024 fines: $%{customdata[1]:,.0f}<br>"
+                    "Total 2030 fines: $%{customdata[2]:,.0f}"
+                    "<extra></extra>"
+                ),
+            )
+            fig_own.update_layout(
+                xaxis_title="Owner category",
+                yaxis_title="# of buildings in top-20 set",
+                xaxis_tickangle=-30,
+                margin=dict(l=10, r=10, t=40, b=80),
+            )
+            st.plotly_chart(fig_own, use_container_width=True)
+
+            with st.expander("Show ownership table"):
+                st.dataframe(own_group, use_container_width=True)
+        else:
+            st.info("Column `owner_category` not found in top-20 master dataset; cannot build ownership mix.")
